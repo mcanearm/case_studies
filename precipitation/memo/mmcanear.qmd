@@ -1,0 +1,639 @@
+---
+title: "Precipitation Memo 1"
+format: 
+  pdf:
+    toc: true
+    code-fold: true
+---
+
+```{python}
+
+import numpyro
+
+numpyro.set_host_device_count(4)
+
+from numpyro import distributions as dist
+from numpyro.infer import MCMC, NUTS
+
+# Claude generated - get station information
+import polars as pl
+
+stations = (
+    pl.read_csv("./ghcnd-stations.txt", has_header=False, separator="\x01",
+                quote_char=None, new_columns=["raw"])
+    .select(
+        pl.col("raw").str.slice(0, 11).str.strip_chars().alias("ID"),
+        pl.col("raw").str.slice(12, 8).str.strip_chars().cast(pl.Float64).alias("LAT"),
+        pl.col("raw").str.slice(21, 9).str.strip_chars().cast(pl.Float64).alias("LON"),
+        pl.col("raw").str.slice(31, 6).str.strip_chars().cast(pl.Float64).alias("ELEV"),
+        pl.col("raw").str.slice(38, 2).str.strip_chars().alias("STATE"),
+        pl.col("raw").str.slice(41, 30).str.strip_chars().alias("NAME"),
+    )
+)
+
+```
+
+```{python}
+# Claude generated - map the two GHCN-Daily stations used in this analysis
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.pyplot as plt
+
+# Bigger fonts throughout -- the rendered report page is small, so default
+# matplotlib sizes read as too small once shrunk into the PDF layout. This
+# applies to every plot for the rest of the document.
+plt.rcParams.update({
+    "font.size": 15,
+    "axes.titlesize": 16,
+    "axes.labelsize": 15,
+    "legend.fontsize": 14,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+})
+
+with open("MI_stations.txt") as f:
+    station_ids = [line.strip() for line in f if line.strip()]
+selected = stations.filter(pl.col("ID").is_in(station_ids))
+
+fig = plt.figure(figsize=(7, 8))
+ax = plt.axes(projection=ccrs.PlateCarree())
+
+pad = 0.75
+lon_min, lon_max = selected["LON"].min() - pad, selected["LON"].max() + pad
+lat_min, lat_max = selected["LAT"].min() - pad, selected["LAT"].max() + pad
+ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+ax.add_feature(cfeature.LAND.with_scale("10m"), facecolor="whitesmoke")
+ax.add_feature(cfeature.LAKES.with_scale("10m"), facecolor="lightblue")
+ax.add_feature(cfeature.OCEAN.with_scale("10m"), facecolor="lightblue")
+ax.coastlines(resolution="10m", linewidth=0.7)
+ax.add_feature(cfeature.STATES.with_scale("10m"), linewidth=0.5)
+ax.add_feature(cfeature.BORDERS.with_scale("10m"), linewidth=0.5)
+
+ax.scatter(
+    selected["LON"], selected["LAT"],
+    transform=ccrs.PlateCarree(),
+    color="crimson", s=25, zorder=5,
+)
+
+plt.title("Michigan GHCN-Daily Station Locations")
+plt.show()
+```
+
+```{python}
+# Claude generated - load all MI station precipitation files
+# Some stations have an all-null flag column (M_FLAG/Q_FLAG/OBS_TIME), which
+# pyarrow infers as type Null instead of String, so a plain glob read fails
+# with a schema mismatch. Cast those columns before concatenating.
+import glob
+
+files = sorted(glob.glob("mi_parquet/*.parquet"))
+precip = pl.concat(
+    [
+        pl.read_parquet(f).with_columns(
+            pl.col(["M_FLAG", "Q_FLAG", "S_FLAG", "OBS_TIME"]).cast(pl.Utf8),
+            pl.col("DATE").str.strptime(pl.Date, "%Y%m%d")
+        )
+        for f in files
+    ],
+    how="vertical",
+).join(stations, on="ID", how="left").select(
+    pl.col("ID"), pl.col("LAT"), pl.col("LON"), pl.col("NAME"),
+    pl.col("DATE"), pl.col("DATA_VALUE").alias("PRCP"),
+).sort(["ID", "DATE"])
+precip
+```
+
+```{python}
+# Claude generated - yearly block maxima of daily precipitation, per station
+yearly_max = (
+    precip
+    .with_columns(
+        pl.col("DATE").dt.year().alias("year"),
+    )
+    .group_by(["ID", "year", "LAT", "LON", "NAME"])
+    .agg(pl.col("PRCP").max().alias("PRCP_MAX"))
+    .sort(["ID", "year"])
+)
+yearly_max
+```
+
+```{python}
+yearly_max.group_by("ID").count().sort_values()
+```
+
+```{python}
+# numpyro has no built-in GEV, so we implement it as a custom Distribution.
+# Block maxima converge (Fisher-Tippett-Gnedenko) to a GEV 
+# Standard parameterization (loc, scale, concentration=xi):
+#   z = (x - loc) / scale
+#   xi != 0: logpdf = -log(scale) - (1 + 1/xi) * log1p(xi*z) - (1 + xi*z)^(-1/xi)
+#            support: 1 + xi*z > 0
+#   xi == 0 (Gumbel limit): logpdf = -log(scale) - z - exp(-z)
+# Verified numerically against scipy.stats.genextreme(c=-xi, loc, scale).
+
+import jax
+import numpyro
+from jax import numpy as jnp
+from jax import random, lax
+from numpyro import distributions as dist
+from numpyro.distributions import constraints
+from numpyro.distributions.util import promote_shapes, validate_sample
+from numpyro.infer import MCMC, NUTS
+import arviz as az
+
+# Claude generated - implementation of GEV distribution in Numpyro
+class GEV(dist.Distribution):
+    arg_constraints = {
+        "loc": constraints.real,
+        "scale": constraints.positive,
+        "concentration": constraints.real,
+    }
+    support = constraints.real
+    reparametrized_params = ["loc", "scale", "concentration"]
+
+    def __init__(self, loc, scale, concentration, validate_args=None):
+        self.loc, self.scale, self.concentration = promote_shapes(loc, scale, concentration)
+        batch_shape = lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale), jnp.shape(concentration))
+        super().__init__(batch_shape=batch_shape, validate_args=validate_args)
+
+    def sample(self, key, sample_shape=()):
+        shape = sample_shape + self.batch_shape
+        u = random.uniform(key, shape=shape)
+        xi = self.concentration
+        near0 = jnp.abs(xi) < 1e-6
+        safe_xi = jnp.where(near0, 1.0, xi)
+        z_gumbel = -jnp.log(-jnp.log(u))
+        z_frechet = (jnp.power(-jnp.log(u), -safe_xi) - 1) / safe_xi
+        z = jnp.where(near0, z_gumbel, z_frechet)
+        return self.loc + self.scale * z
+
+    @validate_sample
+    def log_prob(self, value):
+        xi = self.concentration
+        z = (value - self.loc) / self.scale
+        near0 = jnp.abs(xi) < 1e-6
+        safe_xi = jnp.where(near0, 1.0, xi)
+        u = 1 + safe_xi * z
+        valid = jnp.where(near0, True, u > 0)
+        safe_u = jnp.where(valid, u, 1.0)
+
+        logp_gumbel = -jnp.log(self.scale) - z - jnp.exp(-z)
+        logp_frechet = (
+            -jnp.log(self.scale)
+            - (1 + 1 / safe_xi) * jnp.log(safe_u)
+            - jnp.power(safe_u, -1 / safe_xi)
+        )
+        logp = jnp.where(near0, logp_gumbel, logp_frechet)
+        return jnp.where(valid, logp, -jnp.inf)
+```
+```{python}
+# Build a "long format" dataset across all stations: one flat vector of
+# observations (y_all) plus a parallel integer vector (station_idx) saying
+# which station each observation belongs to. Advanced indexing
+# (loc[station_idx]) then broadcasts each station's parameter out to
+# exactly its own observations
+min_years = 15
+counts = yearly_max.group_by("ID").len().filter(pl.col("len") >= min_years)
+station_ids_h = sorted(counts["ID"].to_list())
+id_to_idx = {sid: i for i, sid in enumerate(station_ids_h)}
+n_stations = len(station_ids_h)
+
+ym = yearly_max.filter(pl.col("ID").is_in(station_ids_h)).sort(["ID", "year"])
+station_idx = jnp.array([id_to_idx[sid] for sid in ym["ID"].to_list()])
+y_all = jnp.array(ym["PRCP_MAX"].to_numpy())
+
+print(f"{n_stations} stations, {y_all.shape[0]} station-years total")
+```
+
+```{python}
+
+n_stations = len(jnp.unique(station_idx))
+
+# lat/lon are station-level covariates (constant within a station), so build
+# one value per station -- aligned to station_ids_h order, same as xi_raw's
+# "stations" plate -- rather than repeating a row per station-year.
+station_latlon = (
+    ym
+    .group_by("ID")
+    .agg(
+        pl.col("LAT").first().alias("LAT"),
+        pl.col("LON").first().alias("LON"),
+        pl.col("NAME").first().alias("NAME"),
+    )
+    .sort("ID")
+)
+assert station_latlon["ID"].to_list() == station_ids_h
+# Standardize the covariates (not the response) -- this only rescales the
+# design matrix and doesn't touch y, so it's not the prior-peeking concern
+# from before; it just keeps lat_beta/lon_beta on a sane numeric scale.
+lat_by_station = jnp.array(station_latlon["LAT"].to_numpy())
+lon_by_station = jnp.array(station_latlon["LON"].to_numpy())
+lat_z = (lat_by_station - lat_by_station.mean()) / lat_by_station.std()
+lon_z = (lon_by_station - lon_by_station.mean()) / lon_by_station.std()
+
+```
+
+```{python}
+def model(n_stations, station_idx, lat, lon, y):
+    # loc is a single constant shared statewide.
+    loc = numpyro.sample("loc", dist.Normal(300.0, 300.0))
+
+    # scale carries the lat/lon spatial trend (in log-space, to keep it
+    # positive) -- this is the classical "index-flood" regional-frequency-
+    # analysis convention: location/scale are the well-estimated parameters
+    # that carry spatial variation, while the shape parameter is treated as
+    # roughly constant across a climatically homogeneous region, since xi
+    # needs far more data to pin down than loc/scale do (this is exactly the
+    # weak-identification problem we saw when xi carried the lat/lon trend).
+
+    lat_lon_sigma = numpyro.sample("lat_long_sigma", dist.InverseGamma(1, 1))
+    log_scale0 = numpyro.sample("log_scale0", dist.Normal(jnp.log(200.0), 1.0))
+    scale_lat_beta = numpyro.sample("scale_lat_beta", dist.Normal(0.0, lat_lon_sigma))
+    scale_lon_beta = numpyro.sample("scale_lon_beta", dist.Normal(0.0, lat_lon_sigma))
+    tau_log_scale = numpyro.sample("tau_log_scale", dist.HalfNormal(0.3))
+
+    log_scale_mean = (
+        log_scale0 + scale_lat_beta * lat + scale_lon_beta * lon
+    )  # length n_stations
+    with numpyro.plate("stations", n_stations):
+        log_scale_raw = numpyro.sample("log_scale_raw", dist.Normal(0.0, 1.0))
+        xi_raw = numpyro.sample("xi_raw", dist.Normal(0.0, 1.0))
+    scale = numpyro.deterministic(
+        "scale", jnp.exp(log_scale_mean + tau_log_scale * log_scale_raw)
+    )
+
+    # xi stays a single pooled hierarchical parameter -- no spatial trend.
+    mu_xi = numpyro.sample("mu_xi", dist.Normal(0.0, 0.2))
+    tau_xi = numpyro.sample("tau_xi", dist.HalfNormal(0.15))
+    xi = numpyro.deterministic("xi", mu_xi + tau_xi * xi_raw)
+
+    with numpyro.plate("obs", y.shape[0]):
+        numpyro.sample("y_obs", GEV(loc, scale[station_idx], xi[station_idx]), obs=y)
+
+
+kernel = NUTS(model, init_strategy=numpyro.infer.init_to_median(num_samples=50))
+mcmc = MCMC(kernel, num_warmup=2000, num_samples=4000, num_chains=4)
+mcmc.run(
+    jax.random.key(23),
+    station_idx=station_idx,
+    y=y_all,
+    lat=lat_z,
+    lon=lon_z,
+    n_stations=n_stations,
+)
+```
+
+
+```{python}
+# station_latlon is already sorted by ID and asserted equal to station_ids_h,
+# so its NAME column is aligned to the same order used to build station_idx.
+# One pair of stations both happen to be named "MARQUETTE" -- disambiguate
+# any repeats by appending the station ID, so each coordinate label stays
+# unique (arviz/xarray don't require uniqueness, but `.sel(station=...)`
+# and plot labels become ambiguous otherwise).
+station_names = station_latlon["NAME"].to_list()
+name_counts = {n: station_names.count(n) for n in set(station_names)}
+station_coord = [
+    f"{name} ({sid})" if name_counts[name] > 1 else name
+    for name, sid in zip(station_names, station_ids_h)
+]
+
+trace = az.from_numpyro(
+    mcmc,
+    coords={"station": station_coord},
+    dims={"xi": ["station"], "scale": ["station"]},
+)
+az.plot_ridge(trace, var_names=["scale"])
+```
+
+```{python}
+az.plot_ridge(trace, var_names=["scale_lat_beta", "scale_lon_beta", "tau_log_scale"])
+```
+
+```{python}
+import numpy as np
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import genpareto, genextreme
+from scipy.optimize import minimize
+from scipy.special import gamma
+from pathlib import Path
+import lmoments3 as lmom
+
+def fit_gev(x):
+    """
+    Fit a generalized extreme value distribution (GEV) using maximum likelihood
+    estimation to the data in 'x'. Probability weighted moments are used to obtain
+    starting values:
+    https://www.stat.cmu.edu/technometrics/80-89/VOL-27-03/v2703251.pdf
+
+    The returned frozen GEV distribution follows the scipy parameterization:
+
+    https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.genextreme.html
+
+    Note that this differs from another common parameterization, which is the one
+    used on Wikipedia:
+
+    https://en.wikipedia.org/wiki/Generalized_extreme_value_distribution
+    """
+
+    x = np.sort(x)
+    n = len(x)
+
+    # Plotting positions
+    pp = np.arange(1 / 2, n + 1 / 2) / n
+
+    # Calculate the first three probability weighted moments
+    b = np.zeros(3)
+    for r in range(3):
+        b[r] = np.dot(pp**r, x) / n
+
+    # The PWM estimator of Hoskins et al.
+    c = (2 * b[1] - b[0]) / (3 * b[2] - b[0]) - np.log(2) / np.log(3)
+    shape = 7.8590 * c + 2.9554 * c**2
+    scale = (2 * b[1] - b[0]) * shape / (gamma(1 + shape) * (1 - 1 / 2**shape))
+    loc = b[0] + scale * (gamma(1 + shape) - 1) / shape
+    ge = genextreme(shape, loc=loc, scale=scale)
+
+    # Get the MLE
+    def f(par):
+        shape, loc, logscale = par
+        d = genextreme(shape, loc=loc, scale=np.exp(logscale))
+        return -d.logpdf(x).sum()
+
+    logscale = np.log(scale)
+    x0 = np.asarray([shape, loc, logscale])
+    rr = minimize(f, x0, method="powell")
+    shape, loc, logscale = rr.x
+    ge = genextreme(shape, loc=loc, scale=np.exp(logscale))
+    return ge
+
+
+gev_ests = {
+    station[0]: fit_gev(sub_df["PRCP_MAX"])
+    for station, sub_df in ym.group_by("ID")
+}
+```
+
+Shrinkage estimator.
+
+```{python}
+# Compare the hierarchical posterior estimate of each station's tail index
+# to its single-station MLE (from gev_ests). scipy's genextreme shape `c`
+# is the negative of the standard EVT tail index xi (see the note in
+# fit_gev), so flip its sign.
+mle_xi = np.array([-gev_ests[sid].args[0] for sid in station_ids_h])
+
+xi_da = trace.posterior["xi"]  # dims: chain, draw, station (in station_ids_h order)
+post_xi_mean = xi_da.mean(dim=("chain", "draw")).values
+post_xi_lo = xi_da.quantile(0.025, dim=("chain", "draw")).values
+post_xi_hi = xi_da.quantile(0.975, dim=("chain", "draw")).values
+
+plt.clf()
+ax = plt.axes()
+plt.grid(True, alpha=0.5)
+lo, hi = min(mle_xi.min(), post_xi_lo.min()), max(mle_xi.max(), post_xi_hi.max())
+ax.plot([lo, hi], [lo, hi], "--", color="gray", label="y = x (no shrinkage)")
+ax.errorbar(
+    mle_xi, post_xi_mean,
+    yerr=[post_xi_mean - post_xi_lo, post_xi_hi - post_xi_mean],
+    fmt="o", alpha=0.6, capsize=2,
+)
+mu_xi_da = trace.posterior["mu_xi"]
+mu_xi_mean = mu_xi_da.mean().item()
+mu_xi_lo = mu_xi_da.quantile(0.025).item()
+mu_xi_hi = mu_xi_da.quantile(0.975).item()
+ax.axhspan(mu_xi_lo, mu_xi_hi, color="orange", alpha=0.15, label="pooled mean ($\\xi$), 95% CI")
+ax.axhline(mu_xi_mean, color="orange", ls=":")
+ax.set_xlabel("MLE tail index ($\\hat\\xi_i$)")
+ax.set_ylabel("Hierarchical posterior tail index ($\\tilde\\xi_i$)")
+ax.set_title("Tail-Index Shrinkage")
+ax.legend()
+plt.show()
+```
+
+```{python}
+# 100-year daily-precipitation return level across Michigan: the GEV quantile
+# z_T solving F(z_T) = 1 - 1/T. This uses posterior-MEAN loc/scale/xi as a
+# point-estimate ("plug-in") surface for a clean map -- not a full posterior
+# average of the return level over all draws, which would differ slightly by
+# Jensen's inequality since z_T is a nonlinear function of xi. Good enough
+# for a point map; a full posterior version would show a spread per pixel.
+def gev_return_level(loc, scale, xi, T):
+    p = 1.0 / T
+    return loc + scale / xi * ((-np.log1p(-p)) ** (-xi) - 1.0)
+
+T = 100  # corresponds to once in 100 year storms
+loc_mean = trace.posterior["loc"].mean().item()
+log_scale0_mean = trace.posterior["log_scale0"].mean().item()
+scale_lat_beta_mean = trace.posterior["scale_lat_beta"].mean().item()
+scale_lon_beta_mean = trace.posterior["scale_lon_beta"].mean().item()
+mu_xi_mean = trace.posterior["mu_xi"].mean().item()
+
+# Grid prediction uses only the systematic lat/lon trend (mu_xi for xi, since
+# xi has no spatial trend) -- it deliberately excludes each station's own
+# idiosyncratic residual (tau_log_scale * log_scale_raw), which wouldn't
+# generalize to an arbitrary new location.
+grid_lon, grid_lat = np.meshgrid(
+    np.linspace(lon_min, lon_max, 200),
+    np.linspace(lat_min, lat_max, 200),
+)
+grid_lat_z = (grid_lat - lat_by_station.mean()) / lat_by_station.std()
+grid_lon_z = (grid_lon - lon_by_station.mean()) / lon_by_station.std()
+# scale prediction is the only thing geographic
+scale_surface = np.exp(log_scale0_mean + scale_lat_beta_mean * grid_lat_z + scale_lon_beta_mean * grid_lon_z)
+return_level_surface = gev_return_level(loc_mean, scale_surface, mu_xi_mean, T)
+
+# Station overlay uses each station's own fitted scale/xi (including its
+# partial-pooling residual), so it can be compared honestly to the trend.
+post_scale_by_station = trace.posterior["scale"].mean(dim=("chain", "draw")).values
+post_xi_by_station = trace.posterior["xi"].mean(dim=("chain", "draw")).values
+return_level_by_station = gev_return_level(loc_mean, post_scale_by_station, post_xi_by_station, T)
+
+# Data are in tenths of mm; 1 tenth-mm = 0.01 cm.
+return_level_surface_cm = return_level_surface * 0.01
+return_level_by_station_cm = return_level_by_station * 0.01
+
+# Mask the grid to Michigan's actual land polygon (both peninsulas), not
+# just the rectangular lat/lon bounding box, so only the state is colored.
+import shapely
+import cartopy.io.shapereader as shpreader
+shp = shpreader.natural_earth(resolution="10m", category="cultural", name="admin_1_states_provinces_lakes")
+michigan_geom = next(
+    rec.geometry for rec in shpreader.Reader(shp).records() if rec.attributes.get("name") == "Michigan"
+)
+in_michigan = shapely.contains_xy(michigan_geom, grid_lon, grid_lat)
+return_level_surface_cm = np.where(in_michigan, return_level_surface_cm, np.nan)
+
+vmin = np.floor(np.nanmin(return_level_surface_cm) * 10) / 10
+vmax = np.ceil(np.nanmax(return_level_surface_cm) * 10) / 10
+
+fig = plt.figure(figsize=(7, 8))
+ax = plt.axes(projection=ccrs.PlateCarree())
+ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+cf = ax.contourf(
+    grid_lon, grid_lat, return_level_surface_cm, levels=21, cmap="YlOrRd",
+    vmin=vmin, vmax=vmax, transform=ccrs.PlateCarree(), zorder=1,
+)
+ax.add_feature(cfeature.LAKES.with_scale("10m"), facecolor="white", zorder=2)
+ax.add_feature(cfeature.OCEAN.with_scale("10m"), facecolor="white", zorder=2)
+ax.coastlines(resolution="10m", linewidth=0.7, zorder=3)
+ax.add_feature(cfeature.STATES.with_scale("10m"), linewidth=0.5, zorder=3)
+ax.add_feature(cfeature.BORDERS.with_scale("10m"), linewidth=0.5, zorder=3)
+
+ax.scatter(
+    station_latlon["LON"], station_latlon["LAT"],
+    c=return_level_by_station_cm, cmap="YlOrRd", vmin=vmin, vmax=vmax,
+    edgecolor="black", linewidth=0.6, s=40,
+    transform=ccrs.PlateCarree(), zorder=4,
+)
+
+cbar = plt.colorbar(cf, ax=ax, shrink=0.7, label=f"{T}-year daily precipitation (cm)")
+cbar.ax.yaxis.set_major_formatter(lambda x, pos: f"{x:.1f}")
+plt.title(f"Posterior mean of {T}-year storm size")
+plt.show()
+```
+
+```{python}
+# Station-level 100-year return level with credible intervals, ordered by
+# posterior mean -- the numeric complement to the map, showing each
+# station's own estimate and uncertainty explicitly instead of as a color.
+rl_samples = gev_return_level(
+    trace.posterior["loc"], trace.posterior["scale"], trace.posterior["xi"], T
+) * 0.01  # cm
+
+rl_mean = rl_samples.mean(dim=("chain", "draw"))
+rl_lo = rl_samples.quantile(0.025, dim=("chain", "draw"))
+rl_hi = rl_samples.quantile(0.975, dim=("chain", "draw"))
+
+order = np.argsort(rl_mean.values)
+labels_sorted = rl_mean["station"].values[order]
+mean_sorted = rl_mean.values[order]
+lo_sorted = rl_lo.values[order]
+hi_sorted = rl_hi.values[order]
+y_pos = np.arange(len(labels_sorted))
+
+fig, ax = plt.subplots(figsize=(7, 10))
+ax.errorbar(
+    mean_sorted, y_pos,
+    xerr=[mean_sorted - lo_sorted, hi_sorted - mean_sorted],
+    fmt="o", color="firebrick", ecolor="black", capsize=3, markersize=4,
+)
+ax.set_yticks(y_pos)
+ax.set_yticklabels(labels_sorted, fontsize=9)
+ax.set_ylim(-1, len(labels_sorted))
+ax.set_xlabel(f"{T}-year daily precipitation return level (cm)")
+ax.set_title(f"Station-level {T}-year return level, ordered\n(posterior mean, 95% credible interval)")
+ax.grid(True, axis="x", alpha=0.4)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+az.summary(trace)
+```
+
+```{python}
+# Both diagnostics (MLE QQ and hierarchical posterior predictive check) for
+# both a small-record and a large-record station, so the two methods can be
+# compared directly at each end of the sample-size range.
+# small_id: fewest years in the fitted set. large_id: most years.
+small_id = "USW00054854"  # Gaylord 9 SSW, 19 years
+large_id = "USW00014824"  # Escanaba, 142 years
+
+loc_draws = trace.posterior["loc"].values.flatten()
+
+
+def mle_qq(station_id):
+    y = np.sort(ym.filter(pl.col("ID") == station_id)["PRCP_MAX"].to_numpy())
+    n = len(y)
+    pp = np.arange(1, n + 1) / (n + 1)
+    q_cm = gev_ests[station_id].ppf(pp) * 0.01
+    return y * 0.01, q_cm
+
+
+def bayes_ppc(station_id):
+    # Simulates a full replicate n-year record from EVERY posterior draw and
+    # uses the spread of simulated order statistics as the band, so it
+    # captures both parameter uncertainty and finite-sample order-statistic
+    # variability (a naive "quantile function + parameter uncertainty" band
+    # undercovers, as found earlier for Ann Arbor).
+    idx = id_to_idx[station_id]
+    y = np.sort(ym.filter(pl.col("ID") == station_id)["PRCP_MAX"].to_numpy())
+    n = len(y)
+    scale_draws = trace.posterior["scale"].values[:, :, idx].flatten()
+    xi_draws = trace.posterior["xi"].values[:, :, idx].flatten()
+    rng = np.random.default_rng(0)
+    u = rng.uniform(size=(loc_draws.shape[0], n))
+    xi_b = xi_draws[:, None]
+    z = ((-np.log(u)) ** (-xi_b) - 1.0) / xi_b
+    sim_sorted = np.sort(loc_draws[:, None] + scale_draws[:, None] * z, axis=1)
+    med_cm = np.median(sim_sorted, axis=0) * 0.01
+    lo_cm = np.quantile(sim_sorted, 0.05, axis=0) * 0.01
+    hi_cm = np.quantile(sim_sorted, 0.95, axis=0) * 0.01
+    return y * 0.01, med_cm, lo_cm, hi_cm
+
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
+
+for ax, (sid, label) in zip(axes, [(small_id, "Gaylord 9 SSW"), (large_id, "Escanaba")]):
+    y_cm, mle_q_cm = mle_qq(sid)
+    y_cm2, med, plo, phi = bayes_ppc(sid)
+
+    lo = min(mle_q_cm.min(), y_cm.min(), plo.min(), y_cm2.min())
+    hi = max(mle_q_cm.max(), y_cm.max(), phi.max(), y_cm2.max())
+    ax.plot([lo, hi], [lo, hi], "--", color="gray", zorder=0)
+
+    ax.scatter(mle_q_cm, y_cm, color="darkorange", alpha=0.75, s=50, label="MLE")
+    ax.errorbar(
+        med, y_cm2, xerr=[med - plo, phi - med],
+        fmt="o", color="teal", ecolor="lightseagreen", alpha=0.75, capsize=2,
+        label="Hierarchical posterior",
+    )
+
+    ax.set_xlabel("Model-fitted GEV quantile (cm)")
+    ax.set_ylabel("Observed annual max (cm)")
+    ax.set_title(f"{label} (n={len(y_cm)})")
+    ax.grid(True, alpha=0.4)
+    ax.legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# Directional evidence for the lat/lon effect on scale, reported as a
+# posterior probability rather than "does the credible interval exclude
+# zero" -- P(beta < 0 | data) is a direct, honest Bayesian statement and
+# needs no correction for repeated testing the way a frequentist p-value
+# comparison would.
+p_lat_neg = (trace.posterior["scale_lat_beta"] < 0).mean().item()
+p_lon_neg = (trace.posterior["scale_lon_beta"] < 0).mean().item()
+print(f"P(scale_lat_beta < 0 | data) = {p_lat_neg:.3f}")
+print(f"P(scale_lon_beta < 0 | data) = {p_lon_neg:.3f}")
+```
+
+```{python}
+# Compare within-station uncertainty (each station's own 95% credible
+# interval for its return level) to the across-station geographic spread
+# (range of point estimates across the state). If per-station CI widths are
+# comparable to or larger than the geographic spread, that's the
+# quantitative version of "the lat/lon effect isn't practically meaningful."
+rl_samples_cm = gev_return_level(
+    trace.posterior["loc"], trace.posterior["scale"], trace.posterior["xi"], T
+) * 0.01
+rl_lo_by_station = rl_samples_cm.quantile(0.025, dim=("chain", "draw")).values
+rl_hi_by_station = rl_samples_cm.quantile(0.975, dim=("chain", "draw")).values
+ci_width_by_station = rl_hi_by_station - rl_lo_by_station
+
+state_spread = return_level_by_station_cm.max() - return_level_by_station_cm.min()
+
+print(f"Per-station 95% CI width (cm): mean={ci_width_by_station.mean():.2f}, "
+      f"median={np.median(ci_width_by_station):.2f}, "
+      f"range=[{ci_width_by_station.min():.2f}, {ci_width_by_station.max():.2f}]")
+print(f"Spread of point estimates across all stations (max - min): {state_spread:.2f} cm")
+```
+

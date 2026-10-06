@@ -11,9 +11,9 @@ urls = [
     "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/YYYY/DataFiles/BMX_CC.xpt",
     "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/YYYY/DataFiles/BPX_CC.xpt",
     "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/YYYY/DataFiles/BIOPRO_CC.xpt",
-    ]
+]
 
-pa = "/home/kshedden/data/Teaching/nhanes"
+pa = "./nhanes"
 os.makedirs(pa, exist_ok=True)
 
 for urlx in urls:
