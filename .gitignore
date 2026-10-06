@@ -11,3 +11,4 @@ bhht/memo/hazard_by_region.png
 *.woff
 *.csv.gz
 *.xpt
+*.pyc

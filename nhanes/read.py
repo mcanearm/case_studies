@@ -1,7 +1,8 @@
 import pandas as pd
 import os
+from pathlib import Path
 
-pa = "/home/kshedden/data/Teaching/nhanes/2017-2018"
+pa = Path("/Users/mmcanear/Projects/PhD_Courses/STAT604/case_studies/nhanes/2017")
 
 fn = ["DEMO_J.csv.gz", "BMX_J.csv.gz", "BPX_J.csv.gz", "BIOPRO_J.csv.gz"]
 
@@ -15,6 +16,8 @@ df = pd.merge(df, da[2], how="left", on="SEQN")
 df = pd.merge(df, da[3], how="left", on="SEQN")
 
 df["RIAGENDR"] = df["RIAGENDR"].replace([1, 2], ["M", "F"])
-df["RIDRETH1"] = df["RIDRETH1"].replace([1, 2, 3, 4, 5], ["MA", "OH", "NHW", "NHB", "Other"])
+df["RIDRETH1"] = df["RIDRETH1"].replace(
+    [1, 2, 3, 4, 5], ["MA", "OH", "NHW", "NHB", "Other"]
+)
 
 df = df.loc[df.RIDAGEYR >= 18, :]
