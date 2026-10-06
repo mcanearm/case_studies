@@ -1,7 +1,8 @@
 import os, requests
 import pandas as pd
+from pathlib import Path
 
-year = 2015
+year = 2017
 
 code = {2009: "F", 2011: "G", 2013: "H", 2015: "I", 2017: "J"}[year]
 
@@ -13,7 +14,7 @@ urls = [
     "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/YYYY/DataFiles/BIOPRO_CC.xpt",
 ]
 
-pa = "./nhanes"
+pa = Path("./nhanes/") / str(year)
 os.makedirs(pa, exist_ok=True)
 
 for urlx in urls:
