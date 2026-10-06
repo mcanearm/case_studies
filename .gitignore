@@ -1,0 +1,14 @@
+100_year_return.png
+bhht/cross-verified-database.csv.gz
+bhht/memo/hazard_by_occupation.png
+bhht/memo/hazard_by_region.png
+precipitation/USW00012839.csv.gz
+precipitation/USW00094847.csv.gz
+precipitation/memo/mmcanear.qmd
+*.js
+*.parquet
+*.css
+*.pdf
+*.bib
+*.html
+*.woff
