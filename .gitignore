@@ -2,9 +2,6 @@
 bhht/cross-verified-database.csv.gz
 bhht/memo/hazard_by_occupation.png
 bhht/memo/hazard_by_region.png
-precipitation/USW00012839.csv.gz
-precipitation/USW00094847.csv.gz
-precipitation/memo/mmcanear.qmd
 *.js
 *.parquet
 *.css
@@ -12,3 +9,5 @@ precipitation/memo/mmcanear.qmd
 *.bib
 *.html
 *.woff
+*.csv.gz
+*.xpt
