@@ -1,7 +1,3 @@
-100_year_return.png
-bhht/cross-verified-database.csv.gz
-bhht/memo/hazard_by_occupation.png
-bhht/memo/hazard_by_region.png
 *.js
 *.parquet
 *.css
@@ -12,3 +8,5 @@ bhht/memo/hazard_by_region.png
 *.csv.gz
 *.xpt
 *.pyc
+*.csv
+*.png
