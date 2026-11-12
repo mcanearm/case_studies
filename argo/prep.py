@@ -14,12 +14,11 @@ import numpy as np
 # Path to the NetCDF files here, this path must be the same
 # as 'tpath' in the get_data.py or get_data.R script.  After running
 # prep.py, the contents of tpath can be deleted.
-tpath = Path("/scratch/stats_dept_root/stats_dept1/kshedden/argo/python")
-dpath = tpath / Path("argo/raw")
+dpath = Path("./data/raw/")
 
 # Store the files produced by this script here.  This must
 # agree with the path set in the 'read.py' script.
-qpath = Path("/home/kshedden/data/Teaching/argo/python")
+qpath = Path("./data/cleaned/")
 os.makedirs(qpath, exist_ok=True)
 
 # Retain only profiles that span this range of pressures (these are dbar
@@ -33,6 +32,7 @@ ngrid = 100
 # Interpolate all data onto this pressure grid
 pressure = np.linspace(minpress, maxpress, ngrid)
 
+
 def clean_range(x):
     mn = x.getncattr("valid_min")
     mx = x.getncattr("valid_max")
@@ -40,6 +40,7 @@ def clean_range(x):
     z = np.where(z < mn, 9999, z)
     z = np.where(z > mx, 9999, z)
     return z
+
 
 def get_raw(fn):
     ncf = Dataset(fn, "r")
@@ -54,6 +55,7 @@ def get_raw(fn):
     pres = clean_range(pres)
 
     return lat, lon, pres, temp, psal
+
 
 def interp_profile(pres, temp, psal):
     ii = (pres != 9999) & (temp != 9999) & (psal != 9999)
@@ -77,6 +79,7 @@ def interp_profile(pres, temp, psal):
     psal1 = interp1d(pres, psal)(pressure)
 
     return temp1, psal1
+
 
 def get_profiles():
 
@@ -115,6 +118,7 @@ def get_profiles():
 
     return lat, lon, date, temp, psal
 
+
 lat, lon, date, temp, psal = get_profiles()
 
 date = [x.isoformat() for x in date]
@@ -124,7 +128,7 @@ np.savetxt(qpath / "lat.csv.gz", lat, header="Column1", comments="")
 np.savetxt(qpath / "lon.csv.gz", lon, header="Column1", comments="")
 np.savetxt(qpath / "date.csv.gz", date, fmt="%s", header="Column1", comments="")
 np.savetxt(qpath / "pressure.csv.gz", pressure, header="Column1", comments="")
-#header = ["Column%d" % j for j in range(temp.shape[1])]
-#header = ",".join(header)
+# header = ["Column%d" % j for j in range(temp.shape[1])]
+# header = ",".join(header)
 np.savetxt(qpath / "temp.csv.gz", temp.T, delimiter=",", comments="", fmt="%.3f")
 np.savetxt(qpath / "psal.csv.gz", psal.T, delimiter=",", comments="", fmt="%.3f")

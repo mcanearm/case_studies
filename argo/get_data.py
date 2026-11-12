@@ -3,16 +3,19 @@ Download ARGO data
 """
 
 import os, requests
+from pathlib import Path
+
 
 # Store the raw files in this location.  These files
 # can be deleted after the "prep.py" script is run.
-tpath = "/scratch/stats_dept_root/stats_dept1/kshedden/argo/python"
+tpath = "./data/"
 
 # The file name template.
-target = "%s/argo/raw/OOOO_ocean/YYYY/MM" % tpath
+target = "%s/raw/OOOO_ocean/YYYY/MM" % tpath
 
 # Get the data from this web site
 url = "https://data-argo.ifremer.fr/geo/OOOO_ocean/YYYY/MM/FF"
+
 
 def getdata(ocean, year, month, day):
 
@@ -28,9 +31,13 @@ def getdata(ocean, year, month, day):
     target1 = target1.replace("MM", "%02d" % month)
 
     os.makedirs(target1, exist_ok=True)
-    target1 = "%s/%s" % (target1, fl)
-    response = requests.get(url1)
-    open(target1, "wb").write(response.content)
+    target1 = Path("%s/%s" % (target1, fl))
+
+    if not target1.exists():
+        response = requests.get(url1)
+        with open(target1, "wb") as fp:
+            fp.write(response.content)
+
 
 def get_year(ocean, year):
     for month in range(1, 13):
@@ -42,9 +49,10 @@ def get_year(ocean, year):
         else:
             days = 31
 
-        for day in range(1, days+1):
+        for day in range(1, days + 1):
             print("%s." % day, end="", flush=True)
             getdata(ocean, year, month, day)
         print("")
+
 
 get_year("pacific", 2020)

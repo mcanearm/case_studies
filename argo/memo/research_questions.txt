@@ -1,0 +1,7 @@
+- 2 variables; temperature, salinity
+- 3d space: lat, long, depth (pressure)
+
+Questions to ask?
+- How does the correlation between salinity and temperature change with depth
+    - Qualitative bands, or functional
+    - Location needs to be accounted for alongside seasonality
